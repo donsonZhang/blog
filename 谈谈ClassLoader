@@ -1,0 +1,97 @@
+java.lang
+public abstract class ClassLoader
+
+通过委派模型(delegation model)进行class的加载。每个类加载器有一个关联的父类加载器。当加载一个类时，classLoader会委派给它的parent class loader加载该类。虚拟机内建的classLoader叫做bootstrap class loader,它没有父类加载器。
+
+数组class（array classes）并不是由类加载器创建的，而是由Java运行时（Java runtime）在需要的时候自动创建的。
+
+ClassLoader首先locate指定class的bytecode,然后将该类的bytecode转换成一个运行时的Class。运行时系统分别提供了加载bootstrap classes,extension classes和user classes的class loader。CLASSPATH环境变量指示运行时系统去哪里加载bytecode.
+
+当一个Class被请求时，类加载器首先检查这个Class是否之前已被加载，如果没有，这个类加载器请求他的父加载器加载这个class。当父加载器没有找到这个class时，该类加载器尝试自己加载这个class.
+
+在多线程环境下，自定义类加载器可能存在循环委派模型的问题，从而导致死锁：
+
+
+    Class Hierarchy:
+	  class A extends B
+	  class C extends D
+	
+	ClassLoader Delegation Hierarchy:
+	
+	Custom Classloader CL1:
+	  directly loads class A 
+	  delegates to custom ClassLoader CL2 for class B
+	
+	Custom Classloader CL2:
+	  directly loads class C
+	  delegates to custom ClassLoader CL1 for class D
+	
+	Thread 1:
+	  Use CL1 to load class A (locks CL1)
+	    defineClass A triggers
+	      loadClass B (try to lock CL2)
+	
+	Thread 2:
+	  Use CL2 to load class C (locks CL2)
+	    defineClass C triggers
+	      loadClass D (try to lock CL1)
+
+加载一个Class会同步整个ClassLoader对象，可能导致死锁
+
+JDK1.7引入parallel capable class loader，锁的粒度从classLoader变成了(classLoader+className),缩小了锁的粒度，解决了这个问题：
+
+	Thread 1:
+	  Use CL1 to load class A (locks CL1+A)
+	    defineClass A triggers
+	      loadClass B (locks CL2+B)
+	
+	Thread 2:
+	  Use CL2 to load class C (locks CL2+C)
+	    defineClass C triggers
+	      loadClass D (locks CL1+D)
+
+ClassLoader在初始化的时通过调用registerAsParallelCapable()方法将自己注册成为Parallel capable class loader，从而可以并发的加载class,有助于系统性能的提升。默认情况下，ClassLoader是被注册为Parallel Capable的
+
+附JDK1.8 类ClassLoader的loadClass()方法：
+
+     protected Class<?> loadClass(String name, boolean resolve)
+        throws ClassNotFoundException
+    {
+        synchronized (getClassLoadingLock(name)) {
+            // First, check if the class has already been loaded
+            Class c = findLoadedClass(name);
+            if (c == null) {
+                long t0 = System.nanoTime();
+                try {
+                    if (parent != null) {
+                        c = parent.loadClass(name, false);
+                    } else {
+                        c = findBootstrapClassOrNull(name);
+                    }
+                } catch (ClassNotFoundException e) {
+                    // ClassNotFoundException thrown if class not found
+                    // from the non-null parent class loader
+                }
+
+                if (c == null) {
+                    // If still not found, then invoke findClass in order
+                    // to find the class.
+                    long t1 = System.nanoTime();
+                    c = findClass(name);
+
+                    // this is the defining class loader; record the stats
+                    sun.misc.PerfCounter.getParentDelegationTime().addTime(t1 - t0);
+                    sun.misc.PerfCounter.getFindClassTime().addElapsedTimeFrom(t1);
+                    sun.misc.PerfCounter.getFindClasses().increment();
+                }
+            }
+            if (resolve) {
+                resolveClass(c);
+            }
+            return c;
+        }
+    }
+
+参考资源：
+1.JDK8 ClassLoader源码
+2.http://docs.oracle.com/javase/7/docs/technotes/guides/lang/cl-mt.html
